@@ -7,7 +7,13 @@ import { jsonResponse, errorResponse } from '../utils/response';
 import { generateUUID } from '../utils/uuid';
 import { LIMITS } from '../config/limits';
 import { isTotpEnabled, verifyTotpToken } from '../utils/totp';
-import { createRecoveryCode, recoveryCodeEquals } from '../utils/recovery-code';
+import { createRecoveryCode } from '../utils/recovery-code';
+import {
+  encryptTotpSecret,
+  encryptRecoveryCode,
+  readRecoveryCode,
+  verifyRecoveryCodeAgainstStored,
+} from '../utils/secret-at-rest';
 import { buildAccountKeys } from '../utils/user-decryption';
 
 // CONTRACT:
@@ -338,12 +344,27 @@ export async function handleGetPasswordHint(request: Request, env: Env): Promise
     );
   }
 
+  // Look up the user but DO NOT differentiate the response based on existence —
+  // returning the hint in-band to an unauthenticated caller turns this endpoint
+  // into both a user-enumeration oracle and a hint-disclosure channel for any
+  // attacker who has the victim's email. We record an audit event so an
+  // operator can later wire up out-of-band delivery (email, etc.).
   const user = await storage.getUser(email);
-  const hint = user?.status === 'active' ? normalizeMasterPasswordHint(user.masterPasswordHint) : null;
+  if (user?.status === 'active' && normalizeMasterPasswordHint(user.masterPasswordHint)) {
+    await safeWriteAuditEvent(env, {
+      actorUserId: null,
+      action: 'user.password_hint.requested',
+      targetType: 'user',
+      targetId: user.id,
+      category: 'security',
+      level: 'info',
+      metadata: { email, ...auditRequestMetadata(request) },
+    });
+  }
   return jsonResponse({
     object: 'passwordHint',
-    hasHint: !!hint,
-    masterPasswordHint: hint,
+    hasHint: false,
+    masterPasswordHint: null,
   });
 }
 
@@ -422,7 +443,12 @@ export async function handleSetVerifyDevices(request: Request, env: Env, userId:
     return errorResponse('User verification failed.', 400);
   }
 
-  user.verifyDevices = body.verifyDevices;
+  // The verifyDevices flag was never enforced by the server (no new-device
+  // challenge flow exists yet). Honour the API for client compatibility but
+  // pin the stored value to `true` so the UI does not advertise a protection
+  // that does not actually run. Once a real challenge is implemented, restore
+  // user-controlled persistence here.
+  user.verifyDevices = true;
   user.updatedAt = new Date().toISOString();
   await storage.saveUser(user);
   await writeAuditEvent(storage, {
@@ -434,6 +460,8 @@ export async function handleSetVerifyDevices(request: Request, env: Env, userId:
     targetId: user.id,
     metadata: {
       verifyDevices: user.verifyDevices,
+      requestedValue: body.verifyDevices,
+      note: 'Server enforces verifyDevices=true; user toggle is not honored.',
       ...auditRequestMetadata(request),
     },
   });
@@ -562,6 +590,12 @@ export async function handleChangePassword(request: Request, env: Env, userId: s
   if (typeof body.kdfMemory === 'number') user.kdfMemory = body.kdfMemory;
   if (typeof body.kdfParallelism === 'number') user.kdfParallelism = body.kdfParallelism;
   user.securityStamp = generateUUID();
+  // Invalidate any existing API key — a stolen api_key would otherwise keep
+  // working after the victim changes their master password (client_credentials
+  // grant only checks api_key + securityStamp at issuance time, and the new
+  // securityStamp does not block re-issuance via the old api_key).
+  const hadApiKey = user.apiKey !== null;
+  user.apiKey = null;
   user.updatedAt = new Date().toISOString();
   await storage.saveUser(user);
   await storage.deleteRefreshTokensByUserId(user.id);
@@ -573,7 +607,7 @@ export async function handleChangePassword(request: Request, env: Env, userId: s
     targetId: user.id,
     category: 'security',
     level: 'security',
-    metadata: { email: user.email, ...auditRequestMetadata(request) },
+    metadata: { email: user.email, apiKeyRevoked: hadApiKey, ...auditRequestMetadata(request) },
   });
 
   return new Response(null, { status: 200 });
@@ -620,9 +654,17 @@ export async function handleSetTotpStatus(request: Request, env: Env, userId: st
     if (!verified) {
       return errorResponse('Invalid TOTP token', 400);
     }
-    user.totpSecret = normalizedSecret;
+    // Encrypt at rest; verifyTotpToken consumers go through readTotpSecret.
+    user.totpSecret = await encryptTotpSecret(normalizedSecret, env.JWT_SECRET);
+    // Recovery code: keep existing one if user already has it (otherwise re-enabling
+    // would invalidate codes the user wrote down). Generate + encrypt new code only
+    // when absent. Plaintext for display lives in `recoveryCodePlain`.
+    let recoveryCodePlain: string;
     if (!user.totpRecoveryCode) {
-      user.totpRecoveryCode = createRecoveryCode();
+      recoveryCodePlain = createRecoveryCode();
+      user.totpRecoveryCode = await encryptRecoveryCode(recoveryCodePlain, env.JWT_SECRET);
+    } else {
+      recoveryCodePlain = (await readRecoveryCode(user.totpRecoveryCode, env.JWT_SECRET)) || createRecoveryCode();
     }
     user.updatedAt = new Date().toISOString();
     await storage.saveUser(user);
@@ -637,7 +679,7 @@ export async function handleSetTotpStatus(request: Request, env: Env, userId: st
       targetId: user.id,
       metadata: auditRequestMetadata(request),
     });
-    return jsonResponse({ enabled: true, recoveryCode: user.totpRecoveryCode, object: 'twoFactor' });
+    return jsonResponse({ enabled: true, recoveryCode: recoveryCodePlain, object: 'twoFactor' });
   }
 
   if (body.enabled === false) {
@@ -692,14 +734,26 @@ export async function handleGetTotpRecoveryCode(request: Request, env: Env, user
   const valid = await auth.verifyPassword(currentHash, user.masterPasswordHash, user.email);
   if (!valid) return errorResponse('Invalid password', 400);
 
+  let recoveryCodePlain: string | null = null;
   if (!user.totpRecoveryCode) {
-    user.totpRecoveryCode = createRecoveryCode();
+    recoveryCodePlain = createRecoveryCode();
+    user.totpRecoveryCode = await encryptRecoveryCode(recoveryCodePlain, env.JWT_SECRET);
     user.updatedAt = new Date().toISOString();
     await storage.saveUser(user);
+  } else {
+    recoveryCodePlain = await readRecoveryCode(user.totpRecoveryCode, env.JWT_SECRET);
+    // If decryption fails (corrupted record or JWT_SECRET rotated), rotate to
+    // a fresh code rather than returning broken data.
+    if (!recoveryCodePlain) {
+      recoveryCodePlain = createRecoveryCode();
+      user.totpRecoveryCode = await encryptRecoveryCode(recoveryCodePlain, env.JWT_SECRET);
+      user.updatedAt = new Date().toISOString();
+      await storage.saveUser(user);
+    }
   }
 
   return jsonResponse({
-    code: user.totpRecoveryCode,
+    code: recoveryCodePlain,
     object: 'twoFactorRecover',
   });
 }
@@ -757,14 +811,31 @@ export async function handleRecoverTwoFactor(request: Request, env: Env): Promis
     return errorResponse('Invalid credentials or recovery code', 400);
   }
 
-  if (!recoveryCodeEquals(recoveryCode, user.totpRecoveryCode)) {
+  // Per-account recovery-code budget — independent of per-IP failed-login
+  // counter so distributed attackers cannot iterate the code space by rotating IPs.
+  const recoveryBudget = await rateLimit.consumeBudgetWithWindow(
+    `2fa-recovery:${user.id}`,
+    LIMITS.rateLimit.recoveryCodeAccountMaxAttempts,
+    LIMITS.rateLimit.recoveryCodeAccountLockoutMinutes * 60
+  );
+  if (!recoveryBudget.allowed) {
+    return errorResponse(
+      `Too many failed recovery-code attempts. Try again in ${Math.ceil((recoveryBudget.retryAfterSeconds || 60) / 60)} minutes.`,
+      429
+    );
+  }
+
+  if (!(await verifyRecoveryCodeAgainstStored(recoveryCode, user.totpRecoveryCode, env.JWT_SECRET))) {
     await rateLimit.recordFailedLogin(recoverLimitKey);
     return errorResponse('Invalid credentials or recovery code', 400);
   }
 
   user.totpSecret = null;
-  user.totpRecoveryCode = createRecoveryCode();
+  const newRecoveryPlain = createRecoveryCode();
+  user.totpRecoveryCode = await encryptRecoveryCode(newRecoveryPlain, env.JWT_SECRET);
   user.securityStamp = generateUUID();
+  // Recovery code use implies a credential incident — also rotate api_key.
+  user.apiKey = null;
   user.updatedAt = new Date().toISOString();
   await storage.saveUser(user);
   await storage.deleteRefreshTokensByUserId(user.id);
@@ -783,7 +854,7 @@ export async function handleRecoverTwoFactor(request: Request, env: Env): Promis
   return jsonResponse({
     success: true,
     twoFactorEnabled: false,
-    newRecoveryCode: user.totpRecoveryCode,
+    newRecoveryCode: newRecoveryPlain,
     object: 'twoFactorRecovery',
   });
 }

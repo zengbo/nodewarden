@@ -288,11 +288,17 @@ export async function handleDownloadSendFile(
     return errorResponse('Invalid or expired token', 401);
   }
 
+  // Send payloads are encrypted client-side; the stored contentType comes from
+  // the sender and could be text/html or image/svg+xml. Always serve as opaque
+  // octet-stream with an attachment disposition to prevent same-origin XSS via
+  // the share-link page.
   return new Response(object.body, {
     headers: {
-      'Content-Type': object.contentType || 'application/octet-stream',
+      'Content-Type': 'application/octet-stream',
       'Content-Length': String(object.size),
-      'Cache-Control': 'private, no-cache',
+      'Content-Disposition': `attachment; filename="${fileId}"`,
+      'Cache-Control': 'private, no-store',
+      'X-Content-Type-Options': 'nosniff',
     },
   });
 }

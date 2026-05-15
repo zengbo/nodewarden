@@ -16,7 +16,23 @@ const DEFAULT_CORS_HEADERS = [
   'X-Device-Identifier',
   'X-Device-Name',
   'X-NodeWarden-Web-Session',
+  'X-NodeWarden-Acting-Device-Id',
+  'X-NodeWarden-Import',
 ];
+const ALLOWED_CORS_HEADERS_SET = new Set(DEFAULT_CORS_HEADERS.map((h) => h.toLowerCase()));
+// Per-header name length cap for reflected Access-Control-Request-Headers
+// values — pragmatic guard against header-pollution / cache-poisoning probes.
+const CORS_HEADER_NAME_MAX_LEN = 64;
+const CORS_HEADER_NAME_PATTERN = /^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$/;
+// Headers safe to expose to cross-origin scripts. Keep this explicit; the
+// previous `*` form leaked any future internal header to attacker pages.
+const EXPOSED_HEADERS = [
+  'Content-Length',
+  'Content-Type',
+  'Content-Disposition',
+  'Etag',
+  'Last-Modified',
+].join(', ');
 
 function isExtensionOrigin(origin: string): boolean {
   return (
@@ -56,16 +72,26 @@ function getCorsPolicy(request: Request): { allowOrigin: string | null; allowCre
 }
 
 function buildCorsHeaders(request: Request): Record<string, string> {
+  // Only reflect requested headers that pass shape + allowlist checks. The
+  // previous implementation echoed any value, which expanded the surface for
+  // header pollution probes and bloated preflight responses.
   const requestedHeaders = String(request.headers.get('Access-Control-Request-Headers') || '')
     .split(',')
     .map((value) => value.trim())
-    .filter(Boolean);
-  const allowHeaders = Array.from(new Set([...DEFAULT_CORS_HEADERS, ...requestedHeaders]));
+    .filter(Boolean)
+    .filter((value) =>
+      value.length <= CORS_HEADER_NAME_MAX_LEN
+      && CORS_HEADER_NAME_PATTERN.test(value)
+      && ALLOWED_CORS_HEADERS_SET.has(value.toLowerCase())
+    );
+  const allowHeaders = Array.from(
+    new Set([...DEFAULT_CORS_HEADERS.map((h) => h.toLowerCase()), ...requestedHeaders.map((h) => h.toLowerCase())])
+  );
 
   const headers: Record<string, string> = {
     'Access-Control-Allow-Methods': CORS_METHODS,
     'Access-Control-Allow-Headers': allowHeaders.join(', '),
-    'Access-Control-Expose-Headers': '*',
+    'Access-Control-Expose-Headers': EXPOSED_HEADERS,
     'Access-Control-Max-Age': String(LIMITS.cors.preflightMaxAgeSeconds),
   };
 
@@ -101,6 +127,12 @@ export function applyCors(
   headers.set('X-Content-Type-Options', 'nosniff');
   headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
   headers.set('Content-Security-Policy', "frame-ancestors 'none'; img-src 'self' data:");
+  // HSTS — workers.dev and any custom domain we deploy to are HTTPS only.
+  // 2 years + includeSubDomains; preload omitted to avoid surprising operators
+  // who deploy under shared apex domains.
+  if (!headers.has('Strict-Transport-Security')) {
+    headers.set('Strict-Transport-Security', 'max-age=63072000; includeSubDomains');
+  }
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,

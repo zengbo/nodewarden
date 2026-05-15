@@ -7,7 +7,8 @@ import { LIMITS } from '../config/limits';
 import { isTotpEnabled, verifyTotpToken } from '../utils/totp';
 import { createRefreshToken } from '../utils/jwt';
 import { readAuthRequestDeviceInfo } from '../utils/device';
-import { createRecoveryCode, recoveryCodeEquals } from '../utils/recovery-code';
+import { createRecoveryCode } from '../utils/recovery-code';
+import { readTotpSecret, verifyRecoveryCodeAgainstStored, encryptRecoveryCode } from '../utils/secret-at-rest';
 import { generateUUID } from '../utils/uuid';
 import { issueSendAccessToken } from './sends';
 import {
@@ -26,9 +27,10 @@ const TWO_FACTOR_PROVIDER_RECOVERY_CODE_RESPONSE = '-1';
 const TWO_FACTOR_PROVIDER_RECOVERY_CODE_LEGACY = 8;
 const TWO_FACTOR_PROVIDER_RECOVERY_CODE_ANDROID_REQUEST = 100;
 
-function resolveTotpSecret(userSecret: string | null): string | null {
-  if (userSecret && isTotpEnabled(userSecret)) {
-    return userSecret;
+async function resolveTotpSecret(userSecret: string | null, jwtSecret: string): Promise<string | null> {
+  const plain = await readTotpSecret(userSecret, jwtSecret);
+  if (plain && isTotpEnabled(plain)) {
+    return plain;
   }
   return null;
 }
@@ -76,13 +78,29 @@ function buildRefreshCookie(request: Request, refreshToken: string, maxAgeSecond
   const isHttps = new URL(request.url).protocol === 'https:';
   const parts = [
     `${WEB_REFRESH_COOKIE}=${encodeURIComponent(refreshToken)}`,
-    'Path=/identity/connect',
+    // Scope the cookie to the single endpoint that consumes it; previously /identity/connect leaked
+    // it to neighbouring identity routes that have no business reading the refresh token.
+    'Path=/identity/connect/token',
     'HttpOnly',
     'SameSite=Strict',
     `Max-Age=${Math.max(0, Math.floor(maxAgeSeconds))}`,
   ];
   if (isHttps) parts.push('Secure');
   return parts.join('; ');
+}
+
+// Apply Cache-Control: no-store on any response that may carry credentials so
+// caches / CDNs / browsers do not retain tokens. RFC 6749 §5.1 mandates it for
+// OAuth token endpoints; we apply it to every identity response defensively.
+function noStore(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set('Cache-Control', 'no-store');
+  headers.set('Pragma', 'no-cache');
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 function buildClearedRefreshCookie(request: Request): string {
@@ -97,6 +115,11 @@ function withWebRefreshCookie(request: Request, response: Response, refreshToken
       ? buildRefreshCookie(request, refreshToken, Math.floor(LIMITS.auth.refreshTokenTtlMs / 1000))
       : buildClearedRefreshCookie(request)
   );
+  // Any response that carries (or clears) a refresh token cookie must not be cached.
+  if (!headers.has('Cache-Control')) {
+    headers.set('Cache-Control', 'no-store');
+    headers.set('Pragma', 'no-cache');
+  }
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
@@ -292,7 +315,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
 
     // Optional 2FA: enabled only by per-user secret.
     let trustedTwoFactorTokenToReturn: string | undefined;
-    const effectiveTotpSecret = resolveTotpSecret(user.totpSecret);
+    const effectiveTotpSecret = await resolveTotpSecret(user.totpSecret, env.JWT_SECRET);
     if (effectiveTotpSecret) {
       const canUseRecoveryCode = !!user.totpRecoveryCode;
       const normalizedTwoFactorProvider = String(twoFactorProvider ?? '').trim();
@@ -322,6 +345,20 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
           return twoFactorRequiredResponse('Two factor required.', canUseRecoveryCode);
         }
       } else if (normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_AUTHENTICATOR)) {
+        // Per-account TOTP attempt budget — independent of per-IP login limit
+        // so a distributed attacker cannot bypass it by rotating IPs.
+        const totpBudget = await rateLimit.consumeBudgetWithWindow(
+          `2fa-totp:${user.id}`,
+          LIMITS.rateLimit.totpAccountMaxAttempts,
+          LIMITS.rateLimit.totpAccountLockoutMinutes * 60
+        );
+        if (!totpBudget.allowed) {
+          return identityErrorResponse(
+            `Too many failed 2FA attempts. Try again in ${Math.ceil((totpBudget.retryAfterSeconds || 60) / 60)} minutes.`,
+            'TooManyRequests',
+            429
+          );
+        }
         const totpOk = await verifyTotpToken(effectiveTotpSecret, normalizedTwoFactorToken);
         if (!totpOk) {
           return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
@@ -331,11 +368,28 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
         normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_RECOVERY_CODE_LEGACY) ||
         normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_RECOVERY_CODE_ANDROID_REQUEST)
       ) {
-        if (!recoveryCodeEquals(normalizedTwoFactorToken, user.totpRecoveryCode)) {
+        // Recovery codes are higher-value than TOTP (single-use account reset),
+        // so the threshold is tighter and the window longer.
+        const recoveryBudget = await rateLimit.consumeBudgetWithWindow(
+          `2fa-recovery:${user.id}`,
+          LIMITS.rateLimit.recoveryCodeAccountMaxAttempts,
+          LIMITS.rateLimit.recoveryCodeAccountLockoutMinutes * 60
+        );
+        if (!recoveryBudget.allowed) {
+          return identityErrorResponse(
+            `Too many failed recovery-code attempts. Try again in ${Math.ceil((recoveryBudget.retryAfterSeconds || 60) / 60)} minutes.`,
+            'TooManyRequests',
+            429
+          );
+        }
+        if (!(await verifyRecoveryCodeAgainstStored(normalizedTwoFactorToken, user.totpRecoveryCode, env.JWT_SECRET))) {
           return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
         }
         user.totpSecret = null;
-        user.totpRecoveryCode = createRecoveryCode();
+        // Rotate the recovery code (encrypted at rest); the new plaintext is
+        // not echoed in the login response — the user can retrieve it via
+        // /api/accounts/totp/recovery-code with their master password.
+        user.totpRecoveryCode = await encryptRecoveryCode(createRecoveryCode(), env.JWT_SECRET);
         user.updatedAt = new Date().toISOString();
         await storage.saveUser(user);
         await storage.deleteRefreshTokensByUserId(user.id);
@@ -421,7 +475,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
     const baseResponse = jsonResponse(response);
     return shouldUseWebSession(request)
       ? withWebRefreshCookie(request, baseResponse, refreshToken)
-      : baseResponse;
+      : noStore(baseResponse);
 
   } else if (grantType === 'client_credentials') {
     // Login with client credentials
@@ -551,7 +605,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
     const baseResponse = jsonResponse(response);
     return shouldUseWebSession(request)
       ? withWebRefreshCookie(request, baseResponse, refreshToken)
-      : baseResponse;
+      : noStore(baseResponse);
 
   } else if (grantType === 'send_access') {
     const sendAccessLimit = await rateLimit.consumeBudget(`${clientIdentifier}:public`, LIMITS.rateLimit.publicRequestsPerMinute);
@@ -691,7 +745,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
     const baseResponse = jsonResponse(response);
     return shouldUseWebSession(request)
       ? withWebRefreshCookie(request, baseResponse, newRefreshToken)
-      : baseResponse;
+      : noStore(baseResponse);
   }
 
   return identityErrorResponse('Unsupported grant type', 'unsupported_grant_type', 400);

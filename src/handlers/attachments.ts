@@ -411,11 +411,18 @@ export async function handlePublicDownloadAttachment(
     return errorResponse('Invalid or expired token', 401);
   }
 
+  // Force a safe download disposition for every attachment: cipher payloads are
+  // opaque encrypted blobs to the server, but the *stored* contentType is
+  // attacker-influenced (set at upload time). Serving HTML/SVG same-origin
+  // would enable XSS, so we ignore the stored type and tell the browser to
+  // treat the body as an opaque download.
   return new Response(object.body, {
     headers: {
-      'Content-Type': object.contentType || 'application/octet-stream',
+      'Content-Type': 'application/octet-stream',
       'Content-Length': String(object.size),
-      'Cache-Control': 'private, no-cache',
+      'Content-Disposition': `attachment; filename="${attachmentId}"`,
+      'Cache-Control': 'private, no-store',
+      'X-Content-Type-Options': 'nosniff',
     },
   });
 }

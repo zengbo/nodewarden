@@ -1,6 +1,10 @@
 const TOTP_STEP_SECONDS = 30;
 const TOTP_DIGITS = 6;
 const TOTP_WINDOW = 1; // allow previous/current/next step for small clock drift
+// RFC 4226 §4 R6 requires the shared secret to be at least 128 bits; we follow
+// the §4 recommendation of 160 bits (20 bytes). Reject any secret below that to
+// stop clients enrolling weak / truncated secrets they could brute force.
+const MIN_SECRET_BYTES = 20;
 
 function normalizeBase32(input: string): string {
   const raw = String(input || '').toUpperCase();
@@ -76,6 +80,7 @@ export async function verifyTotpToken(secretRaw: string, tokenRaw: string, nowMs
 
   const secret = base32Decode(secretRaw);
   if (!secret) return false;
+  if (secret.length < MIN_SECRET_BYTES) return false;
 
   const currentCounter = Math.floor(nowMs / 1000 / TOTP_STEP_SECONDS);
   let matched = false;
@@ -94,5 +99,7 @@ export async function verifyTotpToken(secretRaw: string, tokenRaw: string, nowMs
 }
 
 export function isTotpEnabled(secretRaw: string | undefined | null): boolean {
-  return Boolean(secretRaw && normalizeBase32(secretRaw).length > 0);
+  if (!secretRaw) return false;
+  const decoded = base32Decode(secretRaw);
+  return decoded !== null && decoded.length >= MIN_SECRET_BYTES;
 }

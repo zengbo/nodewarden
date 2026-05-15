@@ -8,7 +8,7 @@
     refreshTokenTtlMs: 365 * 24 * 60 * 60 * 1000,
     // Grace window for previous refresh token after rotation (ms).
     // 刷新令牌轮换后的旧令牌宽限窗口（毫秒）。
-    refreshTokenOverlapGraceMs: 30 * 60 * 1000,
+    refreshTokenOverlapGraceMs: 60 * 1000,
     // Refresh token random byte length.
     // 刷新令牌随机字节长度。
     refreshTokenRandomBytes: 32,
@@ -71,6 +71,18 @@
     // Retention window for login IP records.
     // 登录 IP 记录保留时长。
     loginIpRetentionMs: 30 * 24 * 60 * 60 * 1000,
+    // Per-account TOTP failure budget before account-level lockout.
+    // 每账户 TOTP 失败次数上限，达到后锁定。
+    totpAccountMaxAttempts: 5,
+    // Account-level TOTP lockout duration in minutes.
+    // 账户级 TOTP 锁定时长（分钟）。
+    totpAccountLockoutMinutes: 5,
+    // Per-account recovery-code failure budget per hour before account-level lockout.
+    // 每账户每小时恢复码失败次数上限，达到后锁定。
+    recoveryCodeAccountMaxAttempts: 3,
+    // Account-level recovery-code lockout duration in minutes.
+    // 账户级恢复码锁定时长（分钟）。
+    recoveryCodeAccountLockoutMinutes: 60,
   },
   cleanup: {
     // Minimum interval between refresh-token cleanup runs.
